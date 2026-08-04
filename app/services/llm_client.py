@@ -102,32 +102,64 @@ class LLMClient:
             retryable = (httpx.HTTPError,)
         elif settings.llm_provider == "groq":
             async def _call() -> str:
-                async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds) as client:
-                    payload = {
-                        "model": settings.llm_model,
-                        "messages": [
-                            {"role": "system", "content": system},
-                            {"role": "user", "content": user}
-                        ],
-                        "temperature": temperature if temperature is not None else settings.llm_temperature
-                    }
-                    if max_tokens or settings.llm_max_tokens:
-                        payload["max_tokens"] = max_tokens or settings.llm_max_tokens
-                    if format == "json":
-                        payload["response_format"] = {"type": "json_object"}
+                # We can retry up to 5 times specifically for 429 Rate Limits
+                for rate_limit_attempt in range(5):
+                    async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds) as client:
+                        payload = {
+                            "model": settings.llm_model,
+                            "messages": [
+                                {"role": "system", "content": system},
+                                {"role": "user", "content": user}
+                            ],
+                            "temperature": temperature if temperature is not None else settings.llm_temperature
+                        }
+                        if max_tokens or settings.llm_max_tokens:
+                            payload["max_tokens"] = max_tokens or settings.llm_max_tokens
+                        if format == "json":
+                            payload["response_format"] = {"type": "json_object"}
 
-                    headers = {
-                        "Authorization": f"Bearer {settings.groq_api_key}",
-                        "Content-Type": "application/json"
-                    }
-                    response = await client.post(
-                        "https://api.groq.com/openai/v1/chat/completions",
-                        json=payload,
-                        headers=headers
-                    )
-                    response.raise_for_status()
-                    data = response.json()
-                    return data["choices"][0]["message"]["content"].strip()
+                        headers = {
+                            "Authorization": f"Bearer {settings.groq_api_key}",
+                            "Content-Type": "application/json"
+                        }
+                        response = await client.post(
+                            "https://api.groq.com/openai/v1/chat/completions",
+                            json=payload,
+                            headers=headers
+                        )
+                        
+                        if response.status_code == 429 and rate_limit_attempt < 4:
+                            wait_time = 2.0  # default fallback
+                            retry_after = response.headers.get("retry-after")
+                            if retry_after:
+                                try:
+                                    wait_time = float(retry_after)
+                                except ValueError:
+                                    pass
+                            else:
+                                try:
+                                    error_data = response.json()
+                                    message = error_data.get("error", {}).get("message", "")
+                                    match = re.search(r"try again in ([0-9.]+)(s|ms)", message)
+                                    if match:
+                                        value = float(match.group(1))
+                                        unit = match.group(2)
+                                        wait_time = value if unit == "s" else value / 1000.0
+                                except Exception:
+                                    pass
+                            
+                            # Scaling backoff delay based on rate_limit_attempt
+                            wait_time = wait_time + (rate_limit_attempt * 1.5)
+                            logger.warning(
+                                "groq_rate_limit status=429 attempt=%s sleeping=%s seconds before internal retry",
+                                rate_limit_attempt + 1, wait_time
+                            )
+                            await asyncio.sleep(wait_time + 0.5)
+                            continue
+                        
+                        response.raise_for_status()
+                        data = response.json()
+                        return data["choices"][0]["message"]["content"].strip()
 
             retryable = (httpx.HTTPError,)
         else:
