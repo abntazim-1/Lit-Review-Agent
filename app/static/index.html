@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Literature Review Agent</title>
+  <!-- Google Fonts: Outfit (headings) & Inter (body) -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <!-- Lucide Icons -->
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <!-- Styling -->
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="app-container">
+    <!-- Sidebar: Logo & History -->
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <div class="logo">
+          <i data-lucide="book-open"></i>
+          <span>LitReviewAI</span>
+        </div>
+      </div>
+      <button class="btn btn-primary btn-new-job" id="btn-new-job">
+        <i data-lucide="plus"></i> New Review
+      </button>
+      <div class="history-section">
+        <h3>Recent Researches</h3>
+        <ul class="history-list" id="history-list">
+          <!-- Populated dynamically via JS -->
+          <li class="empty-history">No recent reviews</li>
+        </ul>
+      </div>
+    </aside>
+
+    <!-- Main Content Area -->
+    <main class="main-content">
+      <!-- Top Nav -->
+      <header class="top-nav">
+        <div class="status-indicator-bar" id="top-status-bar">
+          <span class="pulse-indicator status-idle"></span>
+          <span id="top-status-text">Ready for new task</span>
+        </div>
+      </header>
+
+      <!-- Panel: Request Form -->
+      <section class="panel active" id="panel-form">
+        <div class="form-container">
+          <div class="hero-header">
+            <h1>Deconstruct any research topic.</h1>
+            <p>Enter a research query. Our multi-agent orchestrator decomposes the topic, queries ArXiv and the web, resolves contradictions, and evaluates synthesized findings recursively.</p>
+          </div>
+          
+          <form id="review-request-form">
+            <div class="form-group">
+              <label for="topic">Research Topic or Question</label>
+              <textarea id="topic" name="topic" rows="3" placeholder="e.g. Efficient attention mechanisms in transformers, or Impact of microplastics on marine biological systems..." required minlength="5" maxlength="500"></textarea>
+            </div>
+
+            <!-- Advanced Options Toggle -->
+            <div class="advanced-toggle" id="advanced-toggle">
+              <span>Advanced Search Parameters</span>
+              <i data-lucide="chevron-down" id="advanced-chevron"></i>
+            </div>
+
+            <!-- Advanced Parameters -->
+            <div class="advanced-options hidden" id="advanced-options">
+              <div class="options-grid">
+                <div class="form-group">
+                  <label for="max-sub-questions">Target Themes / Clusters (1-5)</label>
+                  <input type="number" id="max-sub-questions" name="max_sub_questions" min="1" max="5" value="3">
+                  <span class="field-desc">Groups of related sub-questions assigned to parallel agents</span>
+                </div>
+                <div class="form-group">
+                  <label for="max-papers">Max Papers per Sub-Question (1-20)</label>
+                  <input type="number" id="max-papers" name="max_papers_per_sub_question" min="1" max="20" value="5">
+                  <span class="field-desc">Deduplicated papers searched per question in a theme</span>
+                </div>
+              </div>
+            </div>
+
+            <button type="submit" class="btn btn-submit" id="btn-submit">
+              <span>Initiate Deep Review</span>
+              <i data-lucide="arrow-right"></i>
+            </button>
+          </form>
+        </div>
+      </section>
+
+      <!-- Panel: Progress Tracking -->
+      <section class="panel" id="panel-progress">
+        <div class="progress-container">
+          <div class="progress-header">
+            <h2 id="progress-topic-title">Researching Topic</h2>
+            <div class="progress-badge" id="progress-badge-iteration">Round 1</div>
+          </div>
+
+          <!-- Progress Stepper Grid -->
+          <div class="stepper-wrapper">
+            <div class="step" id="step-decomposing">
+              <div class="step-icon"><i data-lucide="git-branch"></i></div>
+              <div class="step-details">
+                <h4>Decomposing Niche</h4>
+                <p class="step-desc">Mapping topic to thematic query clusters</p>
+              </div>
+            </div>
+            <div class="step" id="step-researching">
+              <div class="step-icon"><i data-lucide="search"></i></div>
+              <div class="step-details">
+                <h4>Parallel Research</h4>
+                <p class="step-desc">Retrieving papers and extracting claims</p>
+              </div>
+            </div>
+            <div class="step" id="step-detecting_contradictions">
+              <div class="step-icon"><i data-lucide="git-merge"></i></div>
+              <div class="step-details">
+                <h4>Conflict Cross-Referencing</h4>
+                <p class="step-desc">Finding genuine contradictions between papers</p>
+              </div>
+            </div>
+            <div class="step" id="step-synthesizing">
+              <div class="step-icon"><i data-lucide="edit-3"></i></div>
+              <div class="step-details">
+                <h4>Drafting Synthesis</h4>
+                <p class="step-desc">Writing background and findings sections</p>
+              </div>
+            </div>
+            <div class="step" id="step-evaluating">
+              <div class="step-icon"><i data-lucide="check-square"></i></div>
+              <div class="step-details">
+                <h4>Academic Critique</h4>
+                <p class="step-desc">Evaluating completeness & launching loops</p>
+              </div>
+            </div>
+          </div>
+
+          <!-- Live Activities Log & Discovered Clusters -->
+          <div class="live-grid">
+            <div class="live-card log-card">
+              <h3>Agent Activities & Logs</h3>
+              <div class="log-stream" id="log-stream">
+                <div class="log-entry system">Pipeline initiated...</div>
+              </div>
+            </div>
+            <div class="live-card clusters-card">
+              <h3>Discovered Sub-Themes</h3>
+              <div class="clusters-list" id="progress-clusters-list">
+                <p class="empty-text">Determining themes...</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Panel: Review Results -->
+      <section class="panel" id="panel-results">
+        <div class="results-container">
+          <div class="results-header">
+            <div>
+              <span class="topic-tag">Synthesized Literature Review</span>
+              <h1 id="results-topic-title">Research Topic</h1>
+            </div>
+            <button class="btn btn-secondary" id="btn-export-json">
+              <i data-lucide="download"></i> Export JSON
+            </button>
+          </div>
+
+          <!-- Navigation Tabs -->
+          <nav class="results-tabs">
+            <button class="tab-link active" data-tab="tab-synthesis">
+              <i data-lucide="file-text"></i> Literature Review
+            </button>
+            <button class="tab-link" data-tab="tab-contradictions">
+              <i data-lucide="alert-triangle"></i> Contradictions <span class="badge" id="badge-contradictions">0</span>
+            </button>
+            <button class="tab-link" data-tab="tab-clusters">
+              <i data-lucide="network"></i> Themes & Questions
+            </button>
+            <button class="tab-link" data-tab="tab-references">
+              <i data-lucide="scroll"></i> Bibliography <span class="badge" id="badge-references">0</span>
+            </button>
+          </nav>
+
+          <!-- Tab Panels -->
+          <div class="tab-content" id="tab-synthesis">
+            <article class="synthesis-article">
+              <div class="article-section">
+                <h2>Background & Context</h2>
+                <div class="markdown-content" id="synthesis-background"></div>
+              </div>
+              <div class="article-section">
+                <h2>Methodology Comparison</h2>
+                <div class="markdown-content" id="synthesis-methodology"></div>
+              </div>
+              <div class="article-section">
+                <h2>Key Findings</h2>
+                <div class="markdown-content" id="synthesis-findings"></div>
+              </div>
+              <div class="article-section">
+                <h2>Open Questions</h2>
+                <div class="markdown-content" id="synthesis-open-questions"></div>
+              </div>
+            </article>
+          </div>
+
+          <div class="tab-content hidden" id="tab-contradictions">
+            <div class="contradictions-view">
+              <h2>Identified Academic Contradictions</h2>
+              <p class="section-desc">The following contradictions represent real disagreements or conflicting results on similar datasets, scopes, or baselines flagged by the agent cross-referencing process.</p>
+              <div class="contradictions-grid" id="contradictions-grid">
+                <!-- Rendered dynamically -->
+              </div>
+            </div>
+          </div>
+
+          <div class="tab-content hidden" id="tab-clusters">
+            <div class="clusters-view">
+              <h2>Topic Decomposition Tree</h2>
+              <p class="section-desc">Below are the thematic clusters and sub-questions formulated by the orchestrator (including follow-up loops) to explore the topic.</p>
+              <div class="clusters-grid" id="results-clusters-grid">
+                <!-- Rendered dynamically -->
+              </div>
+            </div>
+          </div>
+
+          <div class="tab-content hidden" id="tab-references">
+            <div class="references-view">
+              <h2>Bibliography & Extracted Claims</h2>
+              <p class="section-desc">Citations assembled deterministically from the final dataset. Expand each card to view structured claims and limitations extracted by parallel agents.</p>
+              <div class="references-list" id="references-list">
+                <!-- Rendered dynamically -->
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- Scripts -->
+  <script src="/static/app.js"></script>
+  <script>
+    // Initialize Lucide Icons
+    lucide.createIcons();
+  </script>
+</body>
+</html>
