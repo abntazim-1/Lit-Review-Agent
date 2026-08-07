@@ -48,7 +48,7 @@ class ReviewPipeline:
             logger.error("[%s] %s", job.job_id, message)
         job.logs.append(f"[{level}] {message}")
 
-    async def run(self, job: ReviewJob) -> None:
+    async def run(self, job: ReviewJob, job_store=None) -> None:
         log = with_context(logger, job_id=job.job_id)
         started = time.monotonic()
         try:
@@ -61,6 +61,8 @@ class ReviewPipeline:
             )
             job.clusters = initial_clusters
             job.sub_questions = [sq for c in initial_clusters for sq in c.sub_questions]
+            if job_store:
+                await job_store.save(job)
 
             themes_str = ", ".join(f"'{c.theme}'" for c in initial_clusters)
             self._log_and_add_to_job(
@@ -90,6 +92,8 @@ class ReviewPipeline:
                 self._log_and_add_to_job(job, "Running Contradiction Detector across claim extractions...")
                 job.contradictions = await self._contradiction_detector.detect(job.agent_results)
                 self._log_and_add_to_job(job, f"Contradiction detection complete. Found {len(job.contradictions)} conflicting claims.")
+                if job_store:
+                    await job_store.save(job)
 
                 # 3. Synthesis
                 job.status = JobStatus.SYNTHESIZING
@@ -101,6 +105,8 @@ class ReviewPipeline:
                     contradictions=job.contradictions,
                 )
                 self._log_and_add_to_job(job, "Draft synthesis complete.")
+                if job_store:
+                    await job_store.save(job)
 
                 # 4. Evaluation
                 job.status = JobStatus.EVALUATING

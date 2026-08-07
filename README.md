@@ -1,116 +1,217 @@
-# Academic Literature Review Agent
+# LitReviewAI — Academic Literature Review Agent
 
-Give it a research topic. It decomposes the topic into sub-questions, runs parallel
-research agents against ArXiv and the web, extracts structured claims from each paper
-(full text where available, abstract as a graceful fallback), cross-references findings
-to flag genuine contradictions between papers, and synthesizes a structured literature
-review: background, methodology comparison, key findings, open questions, and a
-deterministic citation list.
+> Give it a research topic. Get back a structured literature review with citations — automatically.
+
+LitReviewAI is an autonomous multi-agent system that decomposes a research question into sub-questions, runs concurrent search agents against ArXiv and the web, extracts structured claims from full-text PDFs using an LLM, detects genuine contradictions between papers, and synthesises a structured review with a deterministic citation list.
+
+---
 
 ## Architecture
 
+```mermaid
+graph TD
+    USER([User / Browser]) -->|POST /reviews| API[FastAPI\nReview API]
+    USER -->|GET /reviews/:id poll| API
+
+    API -->|"create job\n(SQLite)"| JOBSTORE[(Job Store\nSQLite)]
+    API -->|spawn background task| PIPELINE
+
+    subgraph PIPELINE["Pipeline Orchestration (asyncio)"]
+        ORCH[Orchestrator\nLLM: topic → sub-questions]
+        ORCH --> SEMAPHORE{Semaphore\nmax 5 agents}
+        SEMAPHORE --> RA1[Research Agent 1]
+        SEMAPHORE --> RA2[Research Agent 2]
+        SEMAPHORE --> RAN[Research Agent N...]
+        RA1 & RA2 & RAN --> CONTRA[Contradiction Detector\nLLM: cross-reference claims]
+        CONTRA --> SYNTH[Synthesis Agent\nLLM: write review sections]
+        SYNTH --> EVAL[Evaluation Agent\nLLM: critique + feedback loop]
+        EVAL -->|"pass? → complete\nfail? → decompose follow-ups"| ORCH
+    end
+
+    subgraph RESEARCH["Research Agent (per sub-question)"]
+        ARXIV[ArXiv API\nrate-limited client]
+        WEB[Web Search\nDuckDuckGo / Brave / SerpAPI]
+        DEDUP[Dedup Engine\nexact key + cosine similarity]
+        PDF[PDF Fetcher\nfull text → abstract fallback]
+        LLM_E[LLM Claim Extractor\nGroq / Anthropic]
+        ARXIV & WEB --> DEDUP --> PDF --> LLM_E
+    end
+
+    RA1 & RA2 & RAN --> RESEARCH
+
+    subgraph PERSISTENCE["Persistence (SQLite)"]
+        PAPERDB[(Paper Cache\nmetadata + embeddings)]
+        FINDINGS[(Extraction Cache\nclaims per paper)]
+        JOBSTORE
+    end
+
+    LLM_E -->|"cache hit?\nskip re-extraction"| FINDINGS
+    DEDUP --> PAPERDB
+    PIPELINE -->|checkpoint saves| JOBSTORE
+    API --> JOBSTORE
+
+    subgraph LLM_LAYER["LLM Layer (Groq / Anthropic)"]
+        RATELIM[Global LLM Semaphore\nmax 3 concurrent calls]
+        RETRY[Retry + Backoff\n429 retry-after / 413 fast-fail]
+        RATELIM --> RETRY
+    end
+
+    LLM_E --> LLM_LAYER
+    ORCH & CONTRA & SYNTH & EVAL --> LLM_LAYER
 ```
-Research topic
-      |
-      v
-Orchestrator -- decomposes into 3-5 sub-questions
-      |
-      v
-Research agents (x N, concurrent, semaphore-capped)
-   each: ArXiv search + web search -> dedupe (exact key + embedding
-   similarity) -> fetch PDF (fallback to abstract) -> LLM claim extraction
-      |
-      v
-Contradiction detector -- per sub-question, flags genuine disagreements
-      |
-      v
-Synthesis agent -- writes background / methodology / findings / open
-   questions sections; assembles the reference list deterministically
-      |
-      v
-Structured literature review (JSON), polled via the job API
 
-Memory store (SQLite) sits alongside the research agents and synthesis
-stage: paper metadata, embeddings, and cached extraction results persist
-across jobs so a second query on an overlapping topic reuses prior work
-instead of re-fetching and re-parsing the same PDFs.
+---
+
+## Data Flow
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant API as FastAPI
+    participant DB as SQLite Job Store
+    participant Orch as Orchestrator
+    participant Agents as Research Agents (N parallel)
+    participant CD as Contradiction Detector
+    participant Syn as Synthesis Agent
+    participant Eval as Evaluation Agent
+
+    User->>API: POST /reviews {topic}
+    API->>DB: create job (status=pending)
+    API-->>User: 202 {job_id}
+
+    loop Poll every 3s (adaptive backoff)
+        User->>API: GET /reviews/{job_id}
+        API->>DB: fetch job
+        API-->>User: {status, logs, ...}
+    end
+
+    API->>Orch: decompose(topic)
+    Orch-->>API: [cluster1, cluster2, ...clusterN]
+    DB-->>DB: checkpoint (status=researching)
+
+    par For each cluster (semaphore-capped)
+        Agents->>Agents: search ArXiv + web
+        Agents->>Agents: dedup (exact key + cosine similarity)
+        Agents->>Agents: fetch PDF (fallback to abstract)
+        Agents->>Agents: LLM claim extraction
+    end
+
+    DB-->>DB: checkpoint (status=detecting_contradictions)
+    Agents->>CD: all findings
+    CD-->>Agents: [contradiction list]
+
+    DB-->>DB: checkpoint (status=synthesizing)
+    CD->>Syn: findings + contradictions
+    Syn-->>CD: LiteratureReview (background, findings, citations)
+
+    DB-->>DB: checkpoint (status=evaluating)
+    Syn->>Eval: draft review
+    Eval-->>Syn: {passed, feedback, follow_up_questions}
+
+    alt Evaluation passed OR max iterations reached
+        DB-->>DB: status=complete
+        User->>API: GET /reviews/{job_id}
+        API-->>User: full LiteratureReview JSON
+    else Evaluation failed
+        Eval->>Orch: decompose follow-up questions
+        Note over Orch,Eval: Loop repeats with new clusters
+    end
 ```
 
-### Why these design choices
+---
 
-- **Decomposition is its own stage.** Separating "what to research" from "how to
-  research it" means decomposition quality can be evaluated and iterated on
-  independently of search/extraction quality.
-- **Research agents run concurrently but under a semaphore**, not unbounded fan-out.
-  `MAX_CONCURRENT_RESEARCH_AGENTS` caps how many sub-questions are in flight at once,
-  so 20 sub-questions don't turn into 20 simultaneous ArXiv/PDF/LLM calls.
-- **A single shared rate limiter gates all ArXiv calls** across every concurrent agent,
-  respecting ArXiv's documented etiquette (no more than one request per ~3 seconds)
-  regardless of how much pipeline concurrency is configured.
-- **Dedup is two-layered**: exact `paper_key` matching catches the common case (the
-  same paper found by both ArXiv and web search), and embedding cosine-similarity
-  catches near-duplicates (a web mirror or blog repost with a reworded title).
-- **PDF extraction degrades, never crashes.** A paywalled, scanned, or oversized PDF
-  falls back to abstract-only extraction with `extraction_failed` / `failure_reason`
-  recorded on the finding, so a handful of bad PDFs never take down a whole job.
-- **The web search provider is pluggable** (`WebSearchProvider` ABC). Ships with
-  DuckDuckGo (no API key required) and Brave Search (drop in `BRAVE_API_KEY`); adding
-  Google Scholar via SerpAPI is a ~40-line class following the same interface.
-- **The LLM is the only source of narrative text; the reference list is not.**
-  `SynthesisAgent._collect_references` builds the citation list directly from what
-  was actually fetched and extracted, so citations can never drift from reality even
-  if the model hallucinates in prose.
-- **Contradiction detection is conservative by prompt design**: papers that differ in
-  scope, dataset, or setting are explicitly *not* contradictions -- only claims that
-  cannot both be true on the same question are flagged.
+## Tech Stack
 
-## Project layout
+| Layer | Technology | Why |
+|---|---|---|
+| **API** | FastAPI + Starlette | Async-native, automatic OpenAPI docs, lifespan management |
+| **LLM** | Groq (LLaMA 3.3 70B) / Anthropic Claude | Pluggable via `LLMClient` — swap provider in `.env` |
+| **Concurrency** | `asyncio.gather` + `asyncio.Semaphore` | Fine-grained control over parallelism without threads |
+| **Search** | ArXiv Atom API + pluggable web search | `WebSearchProvider` ABC — DuckDuckGo, Brave, SerpAPI |
+| **Embeddings** | `sentence-transformers` (local) | Semantic dedup without an external embedding API |
+| **Persistence** | SQLite (two separate DBs) | Paper/extraction cache + job state, zero infrastructure |
+| **Frontend** | Vanilla JS + CSS | No framework dependency, adaptive polling with exponential back-off |
+| **Rate limiting** | Custom Starlette middleware | Read/write bucket separation — GET polls never consume POST budget |
+
+---
+
+## Key Engineering Decisions
+
+### 1. Semaphore-capped concurrency, not unbounded fan-out
+With 5 clusters × 4 sub-questions × 8 papers, a naïve `asyncio.gather` would fire 160 LLM calls simultaneously — guaranteed to exhaust any API quota in seconds. Instead, two semaphores gate the system:
+- `_agent_semaphore` — max 5 research agents running concurrently (pipeline level)
+- `_llm_semaphore` — max 3 LLM calls in-flight (global, across all agents)
+
+This keeps Groq usage well within 30 RPM while maximising throughput.
+
+### 2. Two-stage deduplication
+The same paper can surface via ArXiv search AND a web result with a different title. Stage 1 is a `dict`-based exact paper-key dedup (O(1), catches 95% of cases). Stage 2 is cosine-similarity comparison of title+abstract embeddings — catches mirrors, reposts, and preprint/published version pairs. Papers already seen in any prior pipeline job are excluded before embedding is even computed.
+
+### 3. Deterministic citation assembly
+The LLM writes narrative prose — it does not assemble the reference list. `SynthesisAgent._collect_references` builds citations directly from the structured extraction output, sorted by year and title. This means citations are guaranteed to match what was actually fetched, eliminating the hallucinated reference problem common in LLM-generated reviews.
+
+### 4. Evaluation-feedback loop
+The pipeline doesn't stop at first synthesis. An `EvaluationAgent` critiques the draft and can reject it with specific feedback (e.g., "missing clinical trial evidence"). The pipeline then decomposes follow-up questions from that feedback and runs targeted research rounds — up to `MAX_FEEDBACK_LOOP_ITERATIONS` times.
+
+### 5. Failure isolation at every layer
+- A PDF that 403s, times out, or is too large → falls back to abstract, `failure_reason` recorded
+- An LLM extraction that fails → `extraction_failed=True`, paper skipped in synthesis
+- A web search that exhausts retries → ArXiv results still used
+- A single sub-question failure → other sub-questions complete normally
+
+No single failure cascades to a job failure.
+
+### 6. SQLite-backed job persistence with checkpoints
+Jobs are checkpointed to SQLite after each pipeline phase (decompose → research → contradiction → synthesis). A server restart does not lose job state — the last checkpoint is always readable. The task itself doesn't survive a restart (it runs in the FastAPI process), but the data does.
+
+---
+
+## Project Layout
 
 ```
 app/
-  main.py                    FastAPI app: submit + poll review jobs
-  container.py                Composition root -- wires every service together
-  config.py                    Environment-driven settings (pydantic-settings)
-  core/
-    orchestrator.py            Topic -> sub-questions
-    research_agent.py          Search + fetch + extract, per sub-question
-    contradiction_detector.py  Cross-references findings per sub-question
-    synthesis.py                Writes the final structured review
-    pipeline.py                 Wires the above into one job run
-    prompts.py                   All LLM system prompts, versioned with the code
-  services/
-    llm_client.py                Anthropic wrapper: retries + robust JSON parsing
-    arxiv_client.py             ArXiv Atom API client, rate-limited
-    web_search_client.py       Pluggable web search (DuckDuckGo / Brave)
-    pdf_fetcher.py                PDF download + text extraction, fails soft
-    embeddings.py                 Local sentence-transformer embeddings for dedup
-  db/
-    memory_store.py             SQLite: paper cache + extraction cache across jobs
-    job_store.py                  In-process job tracking with TTL eviction
-  utils/
-    logging_config.py             Structured JSON logging
-    resilience.py                  Retry/backoff + rate limiter primitives
-    rate_limit_middleware.py     Per-IP API rate limiting
-tests/                            Unit tests (parsing, JSON robustness, retries,
-                                   contradiction filtering) -- no network required
-smoke_test.py                     End-to-end pipeline run with all externals mocked
+├── main.py                     FastAPI entry point: submit + poll jobs
+├── container.py                Composition root — single place wiring all dependencies
+├── config.py                   Pydantic-settings: all config from environment
+├── core/
+│   ├── orchestrator.py         Topic decomposition → research clusters
+│   ├── research_agent.py       Search + dedup + fetch + LLM extraction (per sub-question)
+│   ├── contradiction_detector.py  Cross-references claims, flags genuine disagreements
+│   ├── synthesis.py            Writes final review; builds citation list deterministically
+│   ├── evaluation.py           Critiques draft; drives feedback loop
+│   ├── pipeline.py             Orchestrates all stages into one job run
+│   └── prompts.py              All LLM system prompts — versioned with the code
+├── services/
+│   ├── llm_client.py           LLM wrapper: retry/backoff, 429 handling, 413 fast-fail
+│   ├── arxiv_client.py         ArXiv Atom API client with process-wide rate limiting
+│   ├── web_search_client.py    Pluggable web search (DuckDuckGo / Brave / SerpAPI)
+│   ├── pdf_fetcher.py          PDF download + text extraction, fails soft
+│   └── embeddings.py           Local sentence-transformer embeddings for semantic dedup
+├── db/
+│   ├── memory_store.py         SQLite: paper metadata + extraction cache (cross-job)
+│   └── job_store.py            SQLite: job state with TTL eviction + checkpoint saves
+└── utils/
+    ├── rate_limit_middleware.py Per-IP sliding-window limiter (write-only bucket)
+    ├── resilience.py           Retry/backoff primitives + async rate limiter
+    └── logging_config.py       Structured JSON logging
+
+tests/                          Unit + benchmark tests (network-free)
+smoke_test.py                   Full pipeline run with all externals mocked
 ```
 
-## Running it
+---
+
+## Quick Start
 
 ```bash
+git clone https://github.com/yourname/lit-review-agent
+cd lit-review-agent
 cp .env.example .env
-# edit .env and set ANTHROPIC_API_KEY
+# Set GROQ_API_KEY (or ANTHROPIC_API_KEY) in .env
 
-docker compose up --build
-```
-
-Or locally without Docker:
-
-```bash
 pip install -r requirements.txt
-export ANTHROPIC_API_KEY=sk-ant-...
 uvicorn app.main:app --reload
+# Open http://localhost:8000
 ```
 
 ### API
@@ -119,50 +220,37 @@ uvicorn app.main:app --reload
 # Submit a review (returns immediately with a job id)
 curl -X POST http://localhost:8000/reviews \
   -H "Content-Type: application/json" \
-  -d '{"topic": "Retrieval-augmented generation for long-context question answering"}'
-# -> {"job_id": "a1b2c3d4e5f6", "status": "pending", "created_at": "..."}
+  -d '{"topic": "machine learning approaches for Alzheimer disease detection"}'
+# → {"job_id": "a1b2c3d4e5f6", "status": "pending", "created_at": "..."}
 
-# Poll for status / result
+# Poll until complete (status: pending → decomposing → researching → synthesizing → complete)
 curl http://localhost:8000/reviews/a1b2c3d4e5f6
 ```
 
-`status` moves through `pending -> decomposing -> researching ->
-detecting_contradictions -> synthesizing -> complete` (or `failed`, with `error` set).
-Once `complete`, `result` contains the full `LiteratureReview` object.
+---
+
+## Scaling
+
+This ships as a single process — the right amount of infrastructure for on-demand use.
+
+| Bottleneck | Current | Production path |
+|---|---|---|
+| Job storage | SQLite (in-process) | Swap `JobStore` for Redis — same interface, zero other changes |
+| Task execution | FastAPI `BackgroundTasks` | Move to Celery/ARQ so tasks survive restarts and scale horizontally |
+| Paper/embedding store | SQLite | Swap `MemoryStore` for Postgres + pgvector for multi-process sharing |
+| LLM provider | Groq free tier (30 RPM) | Switch `LLM_PROVIDER=anthropic` in `.env`, or add any OpenAI-compatible endpoint |
+
+---
 
 ## Testing
 
 ```bash
-pytest                 # unit tests: XML parsing, JSON-robustness, retry logic,
-                        # contradiction-detector filtering -- all network-free
-python smoke_test.py   # full pipeline run, LLM/search/PDF layers mocked
+# Unit tests (network-free: JSON parsing, retry logic, dedup, contradiction filtering)
+pytest
+
+# Persistence benchmark: proves job survival across simulated process restarts
+pytest tests/test_job_persistence.py -v -s
+
+# Rate-limit correctness: proves GET polling never consumes POST rate-limit budget
+pytest tests/test_rate_limit_correctness.py -v -s
 ```
-
-## Scaling beyond a single process
-
-This ships as a single FastAPI process with an in-memory job store and background
-tasks, which is the right amount of infrastructure for one team running literature
-reviews on demand. If this needs to scale out:
-
-- Swap `JobStore` (in `app/db/job_store.py`) for a Redis- or Postgres-backed
-  implementation behind the same interface -- nothing else changes.
-- Move job execution from `BackgroundTasks` to a real queue (Celery/RQ/Arq) so jobs
-  survive a process restart and multiple API replicas can share one worker pool.
-- `MemoryStore` (SQLite) can be swapped for Postgres + a vector extension (pgvector)
-  if paper volume grows past what a single SQLite file comfortably handles.
-
-## Operational notes
-
-- **Cost/latency**: each paper costs one claim-extraction LLM call; a 5-sub-question
-  review pulling 8 papers each can mean ~40 extraction calls plus 1 decomposition
-  call, up to 5 contradiction-detection calls, and 1 synthesis call. Tune
-  `MAX_PAPERS_PER_SUB_QUESTION` and `MAX_SUB_QUESTIONS` to control this directly.
-  The cache in `MemoryStore` means a paper is only ever extracted once, even across
-  unrelated future jobs.
-- **ArXiv etiquette**: `ARXIV_MIN_REQUEST_INTERVAL_SECONDS` (default 3.1s) is a
-  process-wide floor on request spacing, not a per-agent one -- confirmed by the
-  smoke test and safe to leave as-is unless ArXiv's own guidance changes.
-- **Failure isolation**: a single paper's extraction failure, PDF fetch failure, or
-  a single sub-question's contradiction-detection failure never fails the whole job
-  -- it's recorded (`extraction_failed`, `agent_results[].errors`) and the pipeline
-  continues with what it has.

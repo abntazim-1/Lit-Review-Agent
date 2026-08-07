@@ -30,7 +30,7 @@ async def lifespan(app: FastAPI):
     container = Container()
     configure_logging(container.settings.log_level, container.settings.log_format)
     app.state.container = container
-    app.state.job_store = JobStore()
+    app.state.job_store = JobStore(db_path="./data/jobs.db")
     logger.info("startup_complete papers_cached=%s", container.memory.paper_count())
     yield
     await container.aclose()
@@ -71,9 +71,13 @@ async def submit_review(request: ReviewRequest, background_tasks: BackgroundTask
 
     async def _run():
         try:
-            await container.pipeline.run(job)
+            await container.pipeline.run(job, job_store)
         except Exception:  # noqa: BLE001 - pipeline.run already catches internally; this is a last-resort net
             logger.exception("unhandled_pipeline_error job_id=%s", job.job_id)
+        finally:
+            # Always persist final state (complete or failed) so a page
+            # refresh after a hot-reload still shows the last-known result.
+            await job_store.save(job)
 
     background_tasks.add_task(_run)
 

@@ -39,8 +39,15 @@ class Container:
         self.embeddings = EmbeddingService(self.settings)
         self.memory = MemoryStore(self.settings.sqlite_path)
 
-        self._pdf_semaphore = asyncio.Semaphore(self.settings.max_concurrent_research_agents * 2)
-        self._llm_semaphore = asyncio.Semaphore(self.settings.max_concurrent_research_agents * 2)
+        # LLM concurrency is intentionally kept very low (3 slots).
+        # Groq's free tier allows ~30 requests per minute (RPM) and ~14,400 TPM.
+        # With 5 research agents × 8 papers each = up to 40 extraction calls, running
+        # 10 concurrently (the old value) saturates both quotas in seconds and causes
+        # synthesis to wait many minutes for the TPM window to reset.
+        # 3 concurrent LLM calls ≈ 1 call every ~2s at peak, staying well under 30 RPM
+        # and giving synthesis a clear quota window when research finishes.
+        self._pdf_semaphore = asyncio.Semaphore(4)
+        self._llm_semaphore = asyncio.Semaphore(3)
 
         self.orchestrator = Orchestrator(self.llm, self.settings.max_sub_questions)
         self.contradiction_detector = ContradictionDetector(self.llm)

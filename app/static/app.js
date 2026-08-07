@@ -277,32 +277,107 @@ function updateProgressSteps(status) {
 }
 
 // Polling Loop Manager
+// Uses recursive setTimeout instead of setInterval so each poll waits for the
+// previous one to complete before scheduling the next -- avoids queuing up
+// concurrent requests if the server is slow or backing off on 429s.
+let _pollTimeoutId = null;
+let _pollBackoffMs = 3000;  // Current poll interval; resets to base on success.
+let _consecutive404s = 0;   // 404 = job gone (server restart). Stop after threshold.
+const _POLL_BASE_MS = 3000;
+const _POLL_MAX_MS = 30000;  // Max 30s between polls on repeated 429s.
+const _MAX_404s = 3;         // Stop polling after this many consecutive 404s.
+
 function startPolling(jobId) {
   stopPolling();
+  _pollBackoffMs = _POLL_BASE_MS;
+  _consecutive404s = 0;
   updateTopStatus('Processing...', 'status-running');
-  
-  pollIntervalId = setInterval(async () => {
-    try {
-      const response = await fetch(`/reviews/${jobId}`);
-      if (!response.ok) {
-        throw new Error("HTTP error polling status");
+  _schedulePoll(jobId);
+}
+
+function _schedulePoll(jobId) {
+  _pollTimeoutId = setTimeout(() => _doPoll(jobId), _pollBackoffMs);
+}
+
+async function _doPoll(jobId) {
+  // Guard: if polling was cancelled while this tick was in flight, bail out.
+  if (_pollTimeoutId === null) return;
+
+  try {
+    const response = await fetch(`/reviews/${jobId}`);
+
+    if (response.status === 404) {
+      // 404 means the job no longer exists on the server.
+      // Most likely cause: the server restarted (--reload triggered by a file
+      // change) which wiped the in-memory job store.
+      // This is a terminal condition — retrying will never help.
+      _consecutive404s++;
+      if (_consecutive404s >= _MAX_404s) {
+        stopPolling();
+        updateTopStatus('Job lost — server was restarted', 'status-failed-dot');
+        writeLog(
+          '⚠️ The server restarted while your job was running and the job was lost. ' +
+          'This happens when code files change during a run (hot-reload). ' +
+          'Please click "New Review" and submit again.',
+          'error'
+        );
+        console.warn(`Job ${jobId} returned 404 ${_MAX_404s} times — polling stopped.`);
+        return;
       }
-      const job = await response.json();
-      
-      handlePollUpdate(job);
-    } catch (err) {
-      console.error("Polling error", err);
-      writeLog(`Connection error during status polling: ${err.message}`, 'error');
+      // Give it one or two more tries in case of a brief blip.
+      writeLog(`Job not found (attempt ${_consecutive404s}/${_MAX_404s})...`, 'warning');
+      _schedulePoll(jobId);
+      return;
     }
-  }, 3000);
+
+    if (response.status === 429) {
+      // Server is telling us to slow down. Back off exponentially.
+      const prev = _pollBackoffMs;
+      _pollBackoffMs = Math.min(_pollBackoffMs * 2, _POLL_MAX_MS);
+      console.warn(`Polling 429: backing off from ${prev}ms to ${_pollBackoffMs}ms`);
+      writeLog(`Server busy — slowing status checks to every ${Math.round(_pollBackoffMs/1000)}s`, 'warning');
+      _schedulePoll(jobId);
+      return;
+    }
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    // Successful response — reset both backoff and 404 counter.
+    _consecutive404s = 0;
+    if (_pollBackoffMs !== _POLL_BASE_MS) {
+      writeLog('Connection restored — resuming normal status checks.', 'info');
+      _pollBackoffMs = _POLL_BASE_MS;
+    }
+
+    const job = await response.json();
+    handlePollUpdate(job);
+
+    // Only reschedule if the job is still running.
+    if (job.status !== 'complete' && job.status !== 'failed') {
+      _schedulePoll(jobId);
+    }
+  } catch (err) {
+    console.error('Polling error', err);
+    writeLog(`Connection error during status polling: ${err.message}`, 'error');
+    // Still reschedule — a transient network blip shouldn't stop polling.
+    _schedulePoll(jobId);
+  }
 }
 
 function stopPolling() {
+  if (_pollTimeoutId !== null) {
+    clearTimeout(_pollTimeoutId);
+    _pollTimeoutId = null;
+  }
   if (pollIntervalId) {
     clearInterval(pollIntervalId);
     pollIntervalId = null;
   }
 }
+
+
 
 // Process Polling Response
 function handlePollUpdate(job) {

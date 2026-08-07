@@ -8,6 +8,7 @@ structured extraction steps. Every other module calls `complete()` or
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from typing import Any, Optional
@@ -22,6 +23,28 @@ from app.utils.resilience import retry_async
 logger = get_logger(__name__)
 
 _JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
+
+# Groq's context window is ~32k tokens for llama-3.3-70b-versatile.
+# 1 token ≈ 4 chars, so 32k tokens ≈ 128k chars total (system + user + response).
+# We reserve ~20k chars for the system prompt + response headroom, leaving
+# 108k chars max for the user payload. Using 90k as a conservative safe cap.
+_GROQ_USER_PAYLOAD_MAX_CHARS = 90_000
+
+
+def _truncate_for_groq(user: str) -> tuple[str, bool]:
+    """Truncate user payload to stay within Groq's context limit.
+
+    Returns (possibly truncated payload, was_truncated).
+    Truncation is logged by the caller; doing it here keeps _call() clean.
+    """
+    if len(user) <= _GROQ_USER_PAYLOAD_MAX_CHARS:
+        return user, False
+    truncated = user[:_GROQ_USER_PAYLOAD_MAX_CHARS]
+    # Try to cut at a sentence/paragraph boundary to preserve coherence.
+    last_para = truncated.rfind("\n\n")
+    if last_para > _GROQ_USER_PAYLOAD_MAX_CHARS // 2:
+        truncated = truncated[:last_para]
+    return truncated + "\n\n[Content truncated to fit model context window]", True
 
 
 class LLMError(Exception):
@@ -101,17 +124,27 @@ class LLMClient:
 
             retryable = (httpx.HTTPError,)
         elif settings.llm_provider == "groq":
+            # Truncate up-front so every retry attempt uses the safe payload.
+            safe_user, was_truncated = _truncate_for_groq(user)
+            if was_truncated:
+                logger.warning(
+                    "groq_payload_truncated original_chars=%d truncated_to=%d",
+                    len(user), len(safe_user),
+                )
+
             async def _call() -> str:
-                # We can retry up to 5 times specifically for 429 Rate Limits
+                # Inner loop handles Groq-specific 429 rate-limit back-off separately
+                # from the outer retry_async loop (which handles transient HTTP errors).
+                # This way 429 sleeps don't consume outer retry budget.
                 for rate_limit_attempt in range(5):
                     async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds) as client:
-                        payload = {
+                        payload: dict = {
                             "model": settings.llm_model,
                             "messages": [
                                 {"role": "system", "content": system},
-                                {"role": "user", "content": user}
+                                {"role": "user", "content": safe_user},
                             ],
-                            "temperature": temperature if temperature is not None else settings.llm_temperature
+                            "temperature": temperature if temperature is not None else settings.llm_temperature,
                         }
                         if max_tokens or settings.llm_max_tokens:
                             payload["max_tokens"] = max_tokens or settings.llm_max_tokens
@@ -120,16 +153,18 @@ class LLMClient:
 
                         headers = {
                             "Authorization": f"Bearer {settings.groq_api_key}",
-                            "Content-Type": "application/json"
+                            "Content-Type": "application/json",
                         }
                         response = await client.post(
                             "https://api.groq.com/openai/v1/chat/completions",
                             json=payload,
-                            headers=headers
+                            headers=headers,
                         )
-                        
+
                         if response.status_code == 429 and rate_limit_attempt < 4:
-                            wait_time = 2.0  # default fallback
+                            # Respect Groq's retry-after header when present; fall back to
+                            # parsing the error message; otherwise use exponential backoff.
+                            wait_time = 2.0
                             retry_after = response.headers.get("retry-after")
                             if retry_after:
                                 try:
@@ -139,27 +174,37 @@ class LLMClient:
                             else:
                                 try:
                                     error_data = response.json()
-                                    message = error_data.get("error", {}).get("message", "")
-                                    match = re.search(r"try again in ([0-9.]+)(s|ms)", message)
-                                    if match:
-                                        value = float(match.group(1))
-                                        unit = match.group(2)
-                                        wait_time = value if unit == "s" else value / 1000.0
-                                except Exception:
+                                    msg = error_data.get("error", {}).get("message", "")
+                                    m = re.search(r"try again in ([0-9.]+)(s|ms)", msg)
+                                    if m:
+                                        value = float(m.group(1))
+                                        wait_time = value if m.group(2) == "s" else value / 1000.0
+                                except Exception:  # noqa: BLE001
                                     pass
-                            
-                            # Scaling backoff delay based on rate_limit_attempt
+
+                            # Add scaled jitter to avoid thundering herd across concurrent agents.
                             wait_time = wait_time + (rate_limit_attempt * 1.5)
                             logger.warning(
-                                "groq_rate_limit status=429 attempt=%s sleeping=%s seconds before internal retry",
-                                rate_limit_attempt + 1, wait_time
+                                "groq_rate_limit status=429 attempt=%d sleeping=%.1fs before retry",
+                                rate_limit_attempt + 1, wait_time,
                             )
                             await asyncio.sleep(wait_time + 0.5)
                             continue
-                        
+
+                        if response.status_code == 413:
+                            # 413 means payload is still too large even after pre-truncation.
+                            # Retrying the same payload will never succeed -- raise immediately
+                            # so the outer handler can fall back to the local model.
+                            raise LLMError(
+                                f"groq_payload_too_large: request exceeded Groq context limit "
+                                f"even after truncation to {len(safe_user)} chars"
+                            )
+
                         response.raise_for_status()
                         data = response.json()
                         return data["choices"][0]["message"]["content"].strip()
+
+                raise LLMError("Exhausted Groq 429 retry attempts")
 
             retryable = (httpx.HTTPError,)
         else:
